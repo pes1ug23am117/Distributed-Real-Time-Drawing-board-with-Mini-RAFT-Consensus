@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Distributed Drawing Board</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #1a1a2e; display: flex; flex-direction: column; align-items: center; height: 100vh; }
+    
+    header {
+      width: 100%;
+      padding: 12px 24px;
+      background: #16213e;
+      color: #e2e8f0;
+      font-family: 'Courier New', monospace;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    
+    #status {
+      font-size: 12px;
+      padding: 4px 10px;
+      border-radius: 12px;
+      background: #0f3460;
+      color: #a0aec0;
+    }
+    #status.connected { background: #1a4731; color: #68d391; }
+    #status.disconnected { background: #4a1c1c; color: #fc8181; }
+
+    canvas {
+      cursor: crosshair;
+      background: #ffffff;
+      margin-top: 20px;
+      border-radius: 8px;
+      box-shadow: 0 0 40px rgba(0,0,0,0.5);
+    }
+
+    #toolbar {
+      margin-top: 16px;
+      display: flex;
+      gap: 12px;
+      align-items: center;
+    }
+
+    .color-btn {
+      width: 28px; height: 28px;
+      border-radius: 50%;
+      border: 3px solid transparent;
+      cursor: pointer;
+    }
+    .color-btn.active { border-color: white; }
+
+    #clear-btn {
+      padding: 6px 16px;
+      background: #e53e3e;
+      color: white;
+      border: none;
+      border-radius: 6px;
+      cursor: pointer;
+      font-family: monospace;
+    }
+  </style>
+  <script src="./config.js"></script>
+</head>
+<body>
+
+<header>
+  <span>🖊 Distributed Drawing Board</span>
+  <span id="status">Connecting...</span>
+</header>
+
+<canvas id="canvas" width="900" height="600"></canvas>
+
+<div id="toolbar">
+  <input type="color" id="colorPicker" value="#000000" />
+  <input type="range" id="brushSize" min="1" max="20" value="4" />
+  <button id="clear-btn">Clear</button>
+</div>
+
+<script>
+  const canvas = document.getElementById('canvas');
+  const ctx = canvas.getContext('2d');
+  const statusEl = document.getElementById('status');
+
+  let drawing = false;
+  let color = '#000000';
+  let brushSize = 4;
+  let lastX = 0, lastY = 0;
+
+  function toWebSocketUrl(urlValue) {
+    if (!urlValue) return '';
+    if (urlValue.startsWith('ws://') || urlValue.startsWith('wss://')) return urlValue;
+    if (urlValue.startsWith('http://')) return `ws://${urlValue.slice(7)}`;
+    if (urlValue.startsWith('https://')) return `wss://${urlValue.slice(8)}`;
+    return urlValue;
+  }
+
+  // --- WebSocket ---
+  const wsProtocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
+  const gatewayHost = window.location.hostname || 'localhost';
+  const runtimeGatewayUrl = window.APP_CONFIG && window.APP_CONFIG.gatewayUrl;
+  const defaultGatewayUrl = `${wsProtocol}://${gatewayHost}:8080`;
+  const GATEWAY_URL = toWebSocketUrl(runtimeGatewayUrl) || defaultGatewayUrl;
+  let ws;
+
+  function connect() {
+    ws = new WebSocket(GATEWAY_URL);
+
+    ws.onopen = () => {
+      statusEl.textContent = 'Connected';
+      statusEl.className = 'connected';
+    };
+
+    ws.onclose = () => {
+      statusEl.textContent = 'Reconnecting...';
+      statusEl.className = 'disconnected';
+      setTimeout(connect, 1500); // auto-reconnect
+    };
+
+    ws.onerror = () => ws.close();
+
+    ws.onmessage = (event) => {
+      const msg = JSON.parse(event.data);
+
+      if (msg.type === 'stroke' || msg.type === 'stroke_commit') {
+        drawStroke(msg.data, false); // remote stroke
+      }
+
+      if (msg.type === 'full_state') {
+        // replay all strokes after reconnect
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        msg.strokes.forEach(s => drawStroke(s, false));
+      }
+    };
+  }
+
+  connect();
+
+  // --- Drawing Logic ---
+  function drawStroke(data, send = true) {
+    ctx.beginPath();
+    ctx.moveTo(data.x0, data.y0);
+    ctx.lineTo(data.x1, data.y1);
+    ctx.strokeStyle = data.color;
+    ctx.lineWidth = data.size;
+    ctx.lineCap = 'round';
+    ctx.stroke();
+
+    if (send && ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'stroke', data }));
+    }
+  }
+
+  canvas.addEventListener('mousedown', (e) => {
+    drawing = true;
+    [lastX, lastY] = [e.offsetX, e.offsetY];
+  });
+
+  canvas.addEventListener('mousemove', (e) => {
+    if (!drawing) return;
+    const stroke = {
+      x0: lastX, y0: lastY,
+      x1: e.offsetX, y1: e.offsetY,
+      color, size: brushSize
+    };
+    drawStroke(stroke, true);
+    [lastX, lastY] = [e.offsetX, e.offsetY];
+  });
+
+  canvas.addEventListener('mouseup', () => drawing = false);
+  canvas.addEventListener('mouseleave', () => drawing = false);
+
+  // Touch support
+  canvas.addEventListener('touchstart', (e) => {
+    e.preventDefault();
+    const t = e.touches[0];
+    const rect = canvas.getBoundingClientRect();
+    drawing = true;
+    lastX = t.clientX - rect.left;
+    lastY = t.clientY - rect.top;
+  });
+
+  canvas.addEventListener('touchmove', (e) => {
+    e.preventDefault();
+    if (!drawing) return;
+    const t = e.touches[0];
+    const rect = canvas.getBoundingClientRect();
+    const stroke = {
+      x0: lastX, y0: lastY,
+      x1: t.clientX - rect.left,
+      y1: t.clientY - rect.top,
+      color, size: brushSize
+    };
+    drawStroke(stroke, true);
+    lastX = stroke.x1; lastY = stroke.y1;
+  });
+
+  // Controls
+  document.getElementById('colorPicker').addEventListener('input', e => color = e.target.value);
+  document.getElementById('brushSize').addEventListener('input', e => brushSize = +e.target.value);
+  document.getElementById('clear-btn').addEventListener('click', () => {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    if (ws) ws.send(JSON.stringify({ type: 'clear' }));
+  });
+</script>
+</body>
+</html>
